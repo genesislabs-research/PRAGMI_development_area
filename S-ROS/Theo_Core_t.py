@@ -130,13 +130,16 @@ class TheoCore(nn.Module):
     def __init__(self, spike_dim: int = 128, coord_dim: int = 64,
                  confidence_threshold: float = 0.99, max_engrams: int = 1024,
                  hidden_dim: int = 256, num_layers: int = 2,
-                 beta: float = 0.7, num_steps: int = 25):
+                 beta: float = 0.7, num_steps: int = 25,
+                 match_threshold: float = 0.999):
         super().__init__()
         self.spike_dim = spike_dim
         self.coord_dim = coord_dim
         self.confidence_threshold = confidence_threshold
 
-        self.scam = TheoSCAM(spike_dim, max_engrams=max_engrams)
+        # match_threshold 0.999 = exact match only. Lower it (e.g. 0.7) for
+        # population-coded keys that must be recalled under sensor noise.
+        self.scam = TheoSCAM(spike_dim, max_engrams=max_engrams, match_threshold=match_threshold)
         self.executor = TheoRecurrentExecutor(spike_dim, coord_dim, hidden_dim, num_layers, beta, num_steps)
 
         # Basal ganglia: tonic inhibition of every action channel, released by
