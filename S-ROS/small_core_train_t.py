@@ -81,20 +81,29 @@ from torch.utils.data import DataLoader, Dataset
 # development (teaching files only) and production (stripped files present)
 # environments without modification.
 # NOT a biological concept: import fallback is an engineering pattern.
+#
+# The neuromodulator, epistemic selector and cortical buffer teaching files
+# live in ../Teaching, so that directory is appended to the path (after this
+# one, so S-ROS copies win). The fallback catches any Exception, not just
+# ImportError, because a corrupt production file raises SyntaxError.
 # ---------------------------------------------------------------------------
+_TEACHING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Teaching")
+if os.path.isdir(_TEACHING_DIR) and _TEACHING_DIR not in sys.path:
+    sys.path.append(_TEACHING_DIR)
+
 try:
     from cognitive_kernel_core_c import CognitiveKernel, CognitiveKernelConfig
-except ImportError:
+except Exception:
     from cognitive_kernel_core_t import CognitiveKernel, CognitiveKernelConfig  # type: ignore[no-redef]
 
 try:
     from world_model_ensemble_p import WorldModelEnsemble, WorldModelConfig
-except ImportError:
+except Exception:
     from world_model_ensemble_t import WorldModelEnsemble, WorldModelConfig  # type: ignore[no-redef]
 
 try:
     from neuromodulator_broadcast_p import NeuromodulatorBroadcast, NeuromodulatorConfig
-except ImportError:
+except Exception:
     from neuromodulator_broadcast_t import NeuromodulatorBroadcast, NeuromodulatorConfig  # type: ignore[no-redef]
 
 # Note on import names: the spec references select_batch_by_epistemic_value
@@ -104,12 +113,12 @@ except ImportError:
 # these same names.
 try:
     from epistemic_selector_p import select_batch, select_batch_deterministic
-except ImportError:
+except Exception:
     from epistemic_selector_t import select_batch, select_batch_deterministic  # type: ignore[no-redef]
 
 try:
     from cortical_buffer_p import CorticalBuffer, CorticalBufferConfig
-except ImportError:
+except Exception:
     from cortical_buffer_t import CorticalBuffer, CorticalBufferConfig  # type: ignore[no-redef]
 
 
@@ -637,21 +646,24 @@ def run_tests() -> bool:
         print(f"[FAIL]  8/18  WorldModelEnsemble forward: {e}")
 
     # ------------------------------------------------------------------
-    # Test 9: WorldModelEnsemble learning convergence over 30 steps
+    # Test 9: WorldModelEnsemble learning convergence on a learnable map
     # ------------------------------------------------------------------
     try:
+        # The target must be learnable. Independent random targets have an
+        # MSE floor of ~1.0, which made this test a coin flip.
+        torch.manual_seed(9)
         wm9_cfg = WorldModelConfig()
         wm9 = WorldModelEnsemble(wm9_cfg)
+        true_map = torch.linalg.qr(torch.randn(64, 64))[0]
         losses_9: List[float] = []
-        for _ in range(30):
-            c_now = torch.randn(4, 64)
-            c_next = torch.randn(4, 64)
+        for _ in range(1000):  # the ensemble learns slowly by design (lr 1e-4)
+            c_now = torch.randn(16, 64)
+            c_next = c_now @ true_map
             loss_val = wm9.update(c_now, c_next)
             losses_9.append(loss_val)
-        # MSE should decrease: last 10 mean < first 10 mean
         first_10 = sum(losses_9[:10]) / 10
-        last_10 = sum(losses_9[20:]) / 10
-        assert last_10 < first_10, (
+        last_10 = sum(losses_9[-10:]) / 10
+        assert last_10 < 0.7 * first_10, (
             f"WorldModel did not converge: first_10={first_10:.4f}, last_10={last_10:.4f}"
         )
         print(
@@ -1206,7 +1218,11 @@ def train_small_core(
         # NOT a biological quantity: cross-module training signal is an
         # engineering artifact.
         # ----------------------------------------------------------------
-        enc_coords = coord_proj(embeddings)  # recompute (no grad through proj)
+        # Apply the frozen projection directly rather than through
+        # coord_proj.forward(), which is @torch.no_grad() and would cut the
+        # encoder off from its own loss. The projection is a buffer, so it
+        # still receives no update; only the encoder does.
+        enc_coords = embeddings @ coord_proj.projection
         encoder_target = reconstruction.detach()  # (B, 64), detached from kernel graph
         # encoder_target is in 64-dim space; enc_coords is also 64-dim.
         encoder_loss = F.mse_loss(enc_coords, encoder_target)

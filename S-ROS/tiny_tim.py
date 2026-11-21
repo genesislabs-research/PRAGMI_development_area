@@ -136,8 +136,11 @@ class CA3AttractorNetwork(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         cue = self.mossy_fiber(x)
         state = cue
+        # Snapshot: store_episode() rewrites W in place after this settle,
+        # which would otherwise break loss.backward().
+        W = self.W.clone()
         for _ in range(self.cfg.ca3_settle_steps):
-            recurrent = F.linear(state, self.W)
+            recurrent = F.linear(state, W)
             state = torch.tanh(self.cfg.ca3_recurrent_gain * recurrent + (1-self.cfg.ca3_recurrent_gain)*cue)
         return state, self.schaffer(state)
 

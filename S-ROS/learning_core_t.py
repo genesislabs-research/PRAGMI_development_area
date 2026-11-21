@@ -263,8 +263,11 @@ class CA3AttractorNetwork(nn.Module):
     def retrieve(self, cue: torch.Tensor) -> torch.Tensor:
         state = cue
         gain = self.cfg.ca3_recurrent_gain
+        # Snapshot the weights: store_episode() rewrites W_recurrent in place
+        # after this settle, which would otherwise break loss.backward().
+        W = self.W_recurrent.clone()
         for _ in range(self.cfg.ca3_settle_steps):
-            recurrent = F.linear(state, self.W_recurrent)
+            recurrent = F.linear(state, W)
             state = torch.tanh(gain * recurrent + (1.0 - gain) * cue)
         return state
 
