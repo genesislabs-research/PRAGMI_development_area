@@ -108,6 +108,8 @@ def build_rule_classes() -> List[Dict]:
         "test_pairs": [
             {"input": "line 30: PRINT",
              "output": "Print blank line, next line 40"},
+            {"input": "line 730: PRINT",
+             "output": "Print blank line, next line 740"},
         ],
     })
 
@@ -307,6 +309,8 @@ def build_rule_classes() -> List[Dict]:
         ],
         "test_pairs": [
             {"input": "line 50: END",
+             "output": "Halt program"},
+            {"input": "line 730: END",
              "output": "Halt program"},
         ],
     })

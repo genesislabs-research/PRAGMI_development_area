@@ -21,6 +21,7 @@ Genesis Labs Research, 2026
 Amellia Mendel, Lisa Adler
 """
 
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timezone
 
 from crystallization_manager import CrystallizationManager
+from Theo_Core_t import spike_fn
 from rote_data_generator import build_rule_classes
 
 
@@ -128,8 +130,10 @@ class RoteLearner(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single LIF neuron step: membrane update, threshold, reset."""
         v = self.beta * v + (1 - self.beta) * current
-        spikes = (v >= 1.0).float()
-        v = v * (1 - spikes)
+        # Surrogate gradient. A bare (v >= 1.0).float() has zero gradient, so
+        # nothing below the output projection ever learned.
+        spikes = spike_fn(v - 1.0)
+        v = v * (1 - spikes.detach())
         return v, spikes
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -201,6 +205,8 @@ class HelloWorldTrainer:
             variance_threshold=1e-4,
             consecutive_windows_required=5,
             window_size=20,
+            on_regression="decrystallize",
+            retention_target=0.70,
         )
 
         self.rules = build_rule_classes()
@@ -264,37 +270,52 @@ class HelloWorldTrainer:
         epoch_losses = {}
         crystallization_events = []
 
+        # Interleave rules. Training one rule in a block and probing it straight
+        # afterwards measures recency, not understanding.
+        schedule = []
         for rule in self.rules:
             rid = rule["rule_id"]
-            rc = self.cm.rule_classes[rid]
-            if rc.is_crystallized:
+            if self.cm.rule_classes[rid].is_crystallized:
+                schedule.append((rid, random.choice(rule["train_pairs"]), True))   # replay
+            else:
+                schedule.extend((rid, pair, False) for pair in rule["train_pairs"])
+        random.shuffle(schedule)
+
+        losses_by_rule: Dict[str, List[float]] = {}
+        for rid, pair, is_replay in schedule:
+            loss = self.train_step(pair)
+            self.step_count += 1
+            if is_replay or self.cm.rule_classes[rid].is_crystallized:
                 continue
+            delta = self.compute_weight_delta()
+            losses_by_rule.setdefault(rid, []).append(loss)
 
-            rule_losses = []
-            for pair in rule["train_pairs"]:
-                loss = self.train_step(pair)
-                delta = self.compute_weight_delta()
-                rule_losses.append(loss)
-                self.step_count += 1
+            event = self.cm.step(
+                rule_id=rid,
+                train_loss=loss,
+                delta_norm=delta,
+                model=self.model,
+                encode_fn=self.generalization_encode_fn,
+                decode_fn=self.generalization_decode_fn,
+                compare_fn=self.generalization_compare_fn,
+                eval_interval=self.eval_interval,
+            )
+            if event is not None:
+                crystallization_events.append(event)
+                print(f"\n  CRYSTALLIZED: {rid} at step {event['crystallized_at_step']}")
+                print(f"    generalization: {event['final_generalization_accuracy']:.2%}")
+                print(f"    train loss: {event['final_train_loss']:.4f}")
 
-                event = self.cm.step(
-                    rule_id=rid,
-                    train_loss=loss,
-                    delta_norm=delta,
-                    model=self.model,
-                    encode_fn=self.generalization_encode_fn,
-                    decode_fn=self.generalization_decode_fn,
-                    compare_fn=self.generalization_compare_fn,
-                    eval_interval=self.eval_interval,
-                )
-                if event is not None:
-                    crystallization_events.append(event)
-                    print(f"\n  CRYSTALLIZED: {rid} at step {event['crystallized_at_step']}")
-                    print(f"    generalization: {event['final_generalization_accuracy']:.2%}")
-                    print(f"    train loss: {event['final_train_loss']:.4f}")
+        for rid, losses in losses_by_rule.items():
+            epoch_losses[rid] = sum(losses) / len(losses)
 
-            if rule_losses:
-                epoch_losses[rid] = sum(rule_losses) / len(rule_losses)
+        # Re-test every crystallized rule on the current weights.
+        for rid, acc in self.cm.audit_retention(
+            self.model, self.generalization_encode_fn,
+            self.generalization_decode_fn, self.generalization_compare_fn,
+        ).items():
+            if acc < self.cm.retention_target:
+                print(f"\n  FORGOTTEN: {rid} retention {acc:.0%} -> returned to plastic pool")
 
         return {
             "losses": epoch_losses,
@@ -331,9 +352,13 @@ class HelloWorldTrainer:
         print(f"\nFinal status:")
         for rid, info in self.cm.status().items():
             tag = "FROZEN" if info["crystallized"] else "PLASTIC"
-            gen = info["last_generalization"]
-            gen_str = f"{gen:.2%}" if gen is not None else "N/A"
-            print(f"  [{tag:7s}] {rid:30s} gen:{gen_str}")
+            # Measured now, on the final weights.
+            gen = CrystallizationManager._accuracy(
+                self.cm.rule_classes[rid].test_pairs, self.model, self.generalization_encode_fn,
+                self.generalization_decode_fn, self.generalization_compare_fn)
+            open_gates = [g for g, ok in info["gates"].items() if not ok]
+            why = "" if info["crystallized"] else f"  waiting on: {', '.join(open_gates)}"
+            print(f"  [{tag:7s}] {rid:30s} held-out now:{gen:.2%}{why}")
 
     def save(self, path: str) -> None:
         """Save model and crystallization log."""

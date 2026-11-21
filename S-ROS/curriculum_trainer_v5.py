@@ -20,6 +20,7 @@ Genesis Labs Research, 2026
 Amellia Mendel, Lisa Adler
 """
 
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -216,6 +217,12 @@ class RuleClassifierSNN(nn.Module):
         v = [torch.zeros(batch, self.hidden_dim, device=input_ids.device)
              for _ in range(self.num_lif_layers)]
         spike_acc = torch.zeros(batch, self.hidden_dim, device=input_ids.device)
+        # Spikes each layer emitted on the previous character. The recurrent
+        # input must come from these: the membrane is reset after a spike, so
+        # re-thresholding it (as before) always gave zero and the network was
+        # purely feedforward.
+        prev_spikes = [torch.zeros(batch, self.hidden_dim, device=input_ids.device)
+                       for _ in range(self.num_lif_layers)]
 
         for t in range(seq_len):
             char_emb = self.embedding(input_ids[:, t])
@@ -226,12 +233,11 @@ class RuleClassifierSNN(nn.Module):
                     current = self.lif_weights[i](x)
                 else:
                     current = self.lif_weights[i](spikes_layer)
-                current = current + self.recurrent_weights[i](
-                    surrogate_spike(v[i]) if t > 0 else torch.zeros_like(v[i])
-                )
+                current = current + self.recurrent_weights[i](prev_spikes[i])
                 v[i] = self.beta * v[i] + (1 - self.beta) * current
                 spikes_layer = surrogate_spike(v[i])
                 v[i] = v[i] * (1 - spikes_layer.detach())
+                prev_spikes[i] = spikes_layer
 
             spike_acc = spike_acc + spikes_layer
 
@@ -451,7 +457,7 @@ class CurriculumTrainer:
             model.load_state_dict(self.stage_models[1].state_dict())
 
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
-        cm = CrystallizationManager(**cm_cfg)
+        cm = CrystallizationManager(on_regression="decrystallize", retention_target=0.9, **cm_cfg)
 
         if stage == 0:
             data = build_stage1_data()
@@ -596,34 +602,55 @@ class CurriculumTrainer:
             epoch_losses = {}
             crystallization_events = []
 
+            # Interleave rules. Training one class in a block teaches the
+            # network to answer that class for everything, which Neo's
+            # specificity gate (rightly) refuses.
+            schedule = []
             for rule in data:
                 rid = rule["rule_id"]
-                rc = cm.rule_classes[rid]
-                if rc.is_crystallized:
+                if cm.rule_classes[rid].is_crystallized:
+                    # Replay: one rehearsal per epoch keeps a crystallized rule
+                    # alive in the shared weights. Neo is not told about it.
+                    schedule.append((rid, random.choice(rule["train_pairs"]), True))
+                else:
+                    schedule.extend((rid, pair, False) for pair in rule["train_pairs"])
+            random.shuffle(schedule)
+
+            rule_losses_by_id: Dict[str, List[float]] = {}
+            for rid, pair, is_replay in schedule:
+                loss = self._train_step(stage, pair)
+                self.global_step += 1
+                if is_replay or cm.rule_classes[rid].is_crystallized:
                     continue
+                delta = self._compute_weight_delta(stage)
+                rule_losses_by_id.setdefault(rid, []).append(loss)
 
-                rule_losses = []
-                for pair in rule["train_pairs"]:
-                    loss = self._train_step(stage, pair)
-                    delta = self._compute_weight_delta(stage)
-                    rule_losses.append(loss)
-                    self.global_step += 1
+                event = cm.step(
+                    rule_id=rid,
+                    train_loss=loss,
+                    delta_norm=delta,
+                    model=model,
+                    encode_fn=self._gen_encode_fn(stage),
+                    decode_fn=self._gen_decode_fn(stage),
+                    compare_fn=self._gen_compare_fn(stage),
+                    eval_interval=10,
+                )
+                if event is not None:
+                    crystallization_events.append(event)
 
-                    event = cm.step(
-                        rule_id=rid,
-                        train_loss=loss,
-                        delta_norm=delta,
-                        model=model,
-                        encode_fn=self._gen_encode_fn(stage),
-                        decode_fn=self._gen_decode_fn(stage),
-                        compare_fn=self._gen_compare_fn(stage),
-                        eval_interval=10,
-                    )
-                    if event is not None:
-                        crystallization_events.append(event)
+            for rid, losses in rule_losses_by_id.items():
+                epoch_losses[rid] = sum(losses) / len(losses)
 
-                if rule_losses:
-                    epoch_losses[rid] = sum(rule_losses) / len(rule_losses)
+            # Crystallized is a claim that keeps being checked. Any rule the
+            # network has since forgotten goes back to the plastic pool.
+            retention = cm.audit_retention(
+                model, self._gen_encode_fn(stage), self._gen_decode_fn(stage),
+                self._gen_compare_fn(stage),
+            )
+            for rid, acc in retention.items():
+                if acc < cm.retention_target:
+                    print(f"\n  {C.RED}{C.BOLD} FORGOTTEN {C.RESET} {C.RED}{rid}{C.RESET} "
+                          f"retention {acc:.0%} -> returned to plastic pool")
 
             for event in crystallization_events:
                 rid = event["rule_id"]
@@ -659,6 +686,7 @@ class CurriculumTrainer:
                 save_path = f"{self.save_name}_stage{stage+1}_epoch{epoch}.pt"
                 self._save_checkpoint(stage, save_path, epoch)
 
+        self._save_checkpoint(stage, f"{self.save_name}_stage{stage+1}_epoch{max_epochs}_incomplete.pt", max_epochs)
         elapsed = time.time() - epoch_start
         frac = cm.fraction_crystallized()
         print(f"\n  {C.YELLOW}Stage {stage+1} reached max epochs. {frac:.0%} crystallized ({elapsed:.0f}s){C.RESET}")
@@ -666,9 +694,14 @@ class CurriculumTrainer:
         print(f"\n  {C.BOLD}Final status:{C.RESET}")
         for rid, info in cm.status().items():
             tag = f"{C.GREEN}FROZEN{C.RESET}" if info["crystallized"] else f"{C.RED}PLASTIC{C.RESET}"
-            gen = info["last_generalization"]
-            gen_str = f"{gen:.0%}" if gen is not None else "N/A"
-            print(f"    [{tag:>20s}] {rid:30s} gen:{gen_str}")
+            # Measured now, on the final weights. Never the value from the
+            # moment the rule crystallized.
+            gen = CrystallizationManager._accuracy(
+                cm.rule_classes[rid].test_pairs, model, self._gen_encode_fn(stage),
+                self._gen_decode_fn(stage), self._gen_compare_fn(stage))
+            open_gates = [g for g, ok in info["gates"].items() if not ok]
+            why = "" if info["crystallized"] else f"  waiting on: {', '.join(open_gates)}"
+            print(f"    [{tag:>20s}] {rid:30s} held-out now:{gen:.0%}{why}")
 
         return frac >= 1.0
 
@@ -847,7 +880,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--save", type=str, default="theo_curriculum_v5", help="Save name prefix")
     parser.add_argument("--self-test", action="store_true", help="Run self-tests and exit")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed (training order and init)")
     args = parser.parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     if args.self_test:
         test_char_vocab()

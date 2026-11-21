@@ -489,7 +489,7 @@ def build_stage2_data() -> List[Dict]:
             {"input": "line 200: GOTO 350", "label": 10},
         ],
         "test_pairs": [
-            {"input": "line 30: GOTO 500", "label": 10},
+            {"input": "line 35: GOTO 550", "label": 10},
             {"input": "line 10: GOTO 40", "label": 10},
             {"input": "line 250: GOTO 800", "label": 10},
             {"input": "line 300: GOTO 100", "label": 10},
@@ -655,6 +655,9 @@ def build_stage3_data() -> List[Dict]:
     """
     from rote_data_generator import build_rule_classes
     rote_rules = build_rule_classes()
+    # The Stage 3 model starts from Stage 2's weights, so anything Stage 2
+    # trained on has already been seen. Such lines cannot serve as held-out.
+    seen_in_stage2 = {p["input"] for r in build_stage2_data() for p in r["train_pairs"]}
     stage3_rules = []
     for i, rule in enumerate(rote_rules):
         s3_train = []
@@ -666,6 +669,8 @@ def build_stage3_data() -> List[Dict]:
             })
         s3_test = []
         for pair in rule["test_pairs"]:
+            if pair["input"] in seen_in_stage2:
+                continue
             s3_test.append({
                 "input": pair["input"],
                 "label": i,
@@ -731,7 +736,22 @@ def test_stage2_coverage():
     for r in rules:
         assert len(r["train_pairs"]) >= 20, f"{r['rule_id']} has <20 train pairs"
         assert len(r["test_pairs"]) >= 5, f"{r['rule_id']} has <5 test pairs"
+        train_inputs = {p["input"] for p in r["train_pairs"]}
+        for tp in r["test_pairs"]:
+            assert tp["input"] not in train_inputs, f"Test leak in {r['rule_id']}: {tp['input']!r}"
     print("PASS: test_stage2_coverage")
+
+
+def test_no_leak_across_rules_or_stages():
+    """No held-out line may appear in ANY training set the same weights have seen."""
+    s1, s2, s3 = build_stage1_data(), build_stage2_data(), build_stage3_data()
+    for name, rules, earlier in (("stage1", s1, []), ("stage2", s2, []), ("stage3", s3, s2)):
+        seen = {p["input"] for r in rules + earlier for p in r["train_pairs"]}
+        for r in rules:
+            assert r["test_pairs"], f"{name}/{r['rule_id']} has no held-out pairs left"
+            for tp in r["test_pairs"]:
+                assert tp["input"] not in seen, f"{name}/{r['rule_id']} held-out leak: {tp['input']!r}"
+    print("PASS: test_no_leak_across_rules_or_stages")
 
 
 def test_stage3_has_outputs():
@@ -754,6 +774,7 @@ def test_no_label_collision():
 if __name__ == "__main__":
     test_stage1_coverage()
     test_stage2_coverage()
+    test_no_leak_across_rules_or_stages()
     test_stage3_has_outputs()
     test_no_label_collision()
     print("\nAll curriculum_data tests passed.\n")
