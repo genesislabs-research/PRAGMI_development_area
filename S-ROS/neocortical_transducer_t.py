@@ -1,4 +1,4 @@
-neo"""
+"""
 neocortical_transducer_t.py
 Neocortical Translation Layer: Spike-to-Continuous Population Decoding
 

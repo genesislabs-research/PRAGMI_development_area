@@ -162,7 +162,7 @@ class NeuronPositionRegistry(nn.Module):
         pos = self.get_population_positions(name)
         diff = pos.unsqueeze(0) - pos.unsqueeze(1)
         return torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
-      class DentateGyrus(nn.Module):
+class DentateGyrus(nn.Module):
     """
     Pattern separation via competitive sparse expansion.
     BIOLOGICAL STRUCTURE: Dentate gyrus granule cell layer.
@@ -273,7 +273,7 @@ class CA3AttractorNetwork(nn.Module):
         ca3_state = self.retrieve(ca3_cue)
         ca1_input = self.schaffer_collateral(ca3_state)
         return ca3_state, ca1_input
-      class CA1Comparator(nn.Module):
+class CA1Comparator(nn.Module):
     """
     Novelty detection through mismatch comparison.
     BIOLOGICAL STRUCTURE: CA1 pyramidal cell layer.
@@ -352,7 +352,7 @@ class AstrocyticRegulator(nn.Module):
 
     def get_state(self) -> Dict[str, float]:
         return {"glutamate": self.extrasynaptic_glutamate.item(), "calcium": self.astrocytic_calcium.item()}
-      class EntorhinalCortex(nn.Module):
+class EntorhinalCortex(nn.Module):
     """
     Interface layer and short-term persistent buffer.
     BIOLOGICAL STRUCTURE: Entorhinal cortex layers II and III.

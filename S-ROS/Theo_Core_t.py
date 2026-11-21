@@ -24,7 +24,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict
+from typing import Tuple
+
+from theo_scam import TheoSCAM  # the one canonical S-CAM
 
 
 @dataclass
@@ -35,45 +37,42 @@ class TheoExecutionState:
     yield_to_plastic_core: bool
     mismatch_detected: bool
     requires_hardware_reset: bool
+    source: str = "executor"      # "scam" (frozen engram hit) or "executor" (plastic path)
+    engram_index: int = -1        # S-CAM slot on a hit, else -1
 
 
-class TheoSCAM(nn.Module):
-    """Minimal one-hot engram seed / fallback (not the main executor)."""
-    def __init__(self, spike_dim: int = 128, max_engrams: int = 1024):
-        super().__init__()
-        self.spike_dim = spike_dim
-        self.max_engrams = max_engrams
-        self.register_buffer("sensor_keys", torch.zeros(max_engrams, spike_dim))
-        self.register_buffer("action_values", torch.zeros(max_engrams, spike_dim))
-        self.register_buffer("is_active", torch.zeros(max_engrams, dtype=torch.bool))
+class _SurrogateSpike(torch.autograd.Function):
+    """Heaviside forward, fast-sigmoid derivative backward, so the executor is trainable."""
+    @staticmethod
+    def forward(ctx, v_minus_thr):
+        ctx.save_for_backward(v_minus_thr)
+        return (v_minus_thr >= 0).to(v_minus_thr.dtype)
 
-    def external_retrieve(self, sensor_spikes: torch.Tensor) -> Tuple[torch.Tensor, float, int]:
-        if not self.is_active.any():
-            return torch.zeros_like(sensor_spikes), 0.0, -1
-        similarity = torch.matmul(sensor_spikes.float(), self.sensor_keys.T)
-        similarity = similarity.masked_fill(~self.is_active, float("-inf"))
-        best_idx = torch.argmax(similarity).item()
-        confidence = similarity[0, best_idx].item()
-        return self.action_values[best_idx], confidence, best_idx
+    @staticmethod
+    def backward(ctx, grad_out):
+        (x,) = ctx.saved_tensors
+        return grad_out / (1.0 + 10.0 * x.abs()) ** 2
 
-    @torch.no_grad()
-    def crystallize_skill(self, sensor_pattern: torch.Tensor, action_pattern: torch.Tensor):
-        # Simple seed storage - called only for rare states
-        if not self.is_active.all():
-            idx = torch.where(~self.is_active)[0][0].item()
-        else:
-            idx = 0  # overwrite oldest in minimal mode
-        self.sensor_keys[idx] = sensor_pattern.float()
-        self.action_values[idx] = action_pattern.float()
-        self.is_active[idx] = True
+
+def spike_fn(v_minus_thr: torch.Tensor) -> torch.Tensor:
+    return _SurrogateSpike.apply(v_minus_thr)
 
 
 class TheoRecurrentExecutor(nn.Module):
-    """The real deterministic function approximator - frozen recurrent LIF core."""
+    """
+    Recurrent LIF function approximator: (sensor spikes, coords) -> (action logits, next coords).
+
+    It is plastic until freeze() is called. Spikes use a surrogate gradient, so
+    it can actually be trained; the readout is taken from the mean firing rate
+    of the last layer over num_steps.
+    """
     def __init__(self, spike_dim: int = 128, coord_dim: int = 64,
                  hidden_dim: int = 256, num_layers: int = 2,
                  beta: float = 0.7, num_steps: int = 25):
         super().__init__()
+        self.spike_dim = spike_dim
+        self.coord_dim = coord_dim
+        self.hidden_dim = hidden_dim
         self.beta = beta
         self.num_steps = num_steps
         self.num_layers = num_layers
@@ -88,44 +87,62 @@ class TheoRecurrentExecutor(nn.Module):
 
     def lif_step(self, v: torch.Tensor, current: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         v = self.beta * v + (1 - self.beta) * current
-        spikes = (v >= 1.0).float()
-        v = v * (1 - spikes)  # reset
+        spikes = spike_fn(v - 1.0)
+        v = v * (1 - spikes.detach())  # reset
         return v, spikes
 
     def forward(self, sensor_spikes: torch.Tensor, current_coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.cat([sensor_spikes, current_coords], dim=-1)
 
-        v = [torch.zeros(x.shape[0], 256, device=x.device) for _ in range(self.num_layers)]
+        v = [torch.zeros(x.shape[0], self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         spikes = [torch.zeros_like(v[0]) for _ in range(self.num_layers)]
+        rate = torch.zeros_like(v[0])
 
         for _ in range(self.num_steps):
-            current = x
             for i in range(self.num_layers):
-                current = self.layers[i](current if i == 0 else spikes[i-1])
+                current = self.layers[i](x if i == 0 else spikes[i - 1])
                 v[i], spikes[i] = self.lif_step(v[i], current)
+            rate = rate + spikes[-1]
+        rate = rate / self.num_steps
 
-        final_spikes = spikes[-1]
-        out = self.output_proj(final_spikes)
-        next_action = torch.sign(final_spikes)
-        next_coords = out[:, -64:]   # last 64 dims are next program state
-        return next_action, next_coords
+        out = self.output_proj(rate)
+        action_logits = out[:, :self.spike_dim]
+        next_coords = out[:, self.spike_dim:]
+        return action_logits, next_coords
+
+    def freeze(self) -> None:
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    @property
+    def is_frozen(self) -> bool:
+        return not any(p.requires_grad for p in self.parameters())
 
 
 class TheoCore(nn.Module):
     """
     THEO - Deterministic Recurrent Execution Core
-    Main entry point. Uses recurrent LIF approximator for procedural skills.
+
+    Inference order (README, Stage Zero): S-CAM exact match first, trainable
+    executor second. A matching engram always wins, and its stored action is
+    emitted unmodified, so executor drift cannot change a crystallized skill.
     """
-    def __init__(self, spike_dim: int = 128, coord_dim: int = 64, confidence_threshold: float = 0.99):
+    def __init__(self, spike_dim: int = 128, coord_dim: int = 64,
+                 confidence_threshold: float = 0.99, max_engrams: int = 1024,
+                 hidden_dim: int = 256, num_layers: int = 2,
+                 beta: float = 0.7, num_steps: int = 25):
         super().__init__()
         self.spike_dim = spike_dim
         self.coord_dim = coord_dim
         self.confidence_threshold = confidence_threshold
 
-        self.scam = TheoSCAM(spike_dim)                    # fallback seed only
-        self.executor = TheoRecurrentExecutor(spike_dim, coord_dim)
+        self.scam = TheoSCAM(spike_dim, max_engrams=max_engrams)
+        self.executor = TheoRecurrentExecutor(spike_dim, coord_dim, hidden_dim, num_layers, beta, num_steps)
 
-        self.tonic_inhibition = nn.Parameter(torch.ones(spike_dim) * 10.0)
+        # Basal ganglia: tonic inhibition of every action channel, released by
+        # the striatal selector. Units are logits, so the gate is commensurate
+        # with the executor's output and is learnable.
+        self.tonic_inhibition = nn.Parameter(torch.ones(spike_dim) * 2.0)
         self.striatal_selector = nn.Linear(spike_dim, spike_dim, bias=True)
 
         self.cerebellar_predictor = nn.Sequential(
@@ -135,33 +152,45 @@ class TheoCore(nn.Module):
             nn.Linear(256, coord_dim)
         )
 
-    def forward(self, sensor_spikes: torch.Tensor, current_coords: torch.Tensor) -> TheoExecutionState:
-        # Primary path: recurrent deterministic approximator
-        next_action, predicted_coords = self.executor(sensor_spikes, current_coords)
-
-        # Optional SCAM fallback for very rare states
-        engram_action, conf, _ = self.scam.external_retrieve(sensor_spikes)
-        if conf < 0.7:  # low bar - only for true novelty
-            next_action = engram_action
-
-        # Basal ganglia disinhibition
+    def executor_logits(self, sensor_spikes: torch.Tensor, current_coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Plastic path only (differentiable). Train against this."""
+        action_logits, exec_coords = self.executor(sensor_spikes, current_coords)
         gate_signal = torch.sigmoid(self.striatal_selector(sensor_spikes))
-        active_inhibition = self.tonic_inhibition * (1.0 - gate_signal)
-        selected_action = torch.sign(F.relu(next_action - active_inhibition))
+        gated_logits = action_logits - self.tonic_inhibition * (1.0 - gate_signal)
+        return gated_logits, exec_coords
+
+    def forward(self, sensor_spikes: torch.Tensor, current_coords: torch.Tensor) -> TheoExecutionState:
+        if sensor_spikes.shape[0] != 1:
+            raise ValueError("TheoCore.forward executes one state at a time; use scam.lookup / executor_logits for batches")
+
+        # 1. Frozen engram: exact S-CAM match wins outright.
+        engram_action, score, idx = self.scam.retrieve_engram(sensor_spikes)
+        if idx >= 0:
+            selected_action = engram_action
+            confidence = score
+            source = "scam"
+        else:
+            # 2. Plastic executor through the basal ganglia gate.
+            gated_logits, _ = self.executor_logits(sensor_spikes, current_coords)
+            selected_action = spike_fn(gated_logits)
+            probs = torch.sigmoid(gated_logits)
+            # How far every channel is from the decision boundary (1.0 = fully decided).
+            confidence = float((2.0 * (probs - 0.5).abs()).min().item())
+            source = "executor"
 
         # Cerebellar forward model
         prediction_input = torch.cat([selected_action, current_coords], dim=-1)
         predicted_coords = self.cerebellar_predictor(prediction_input)
 
-        confidence = 0.99 if torch.all(selected_action == next_action) else 0.85
-
         return TheoExecutionState(
             action_spikes=selected_action,
             predicted_coords=predicted_coords,
             confidence=confidence,
-            yield_to_plastic_core=False,
+            yield_to_plastic_core=(source == "executor" and confidence < self.confidence_threshold),
             mismatch_detected=False,
-            requires_hardware_reset=False
+            requires_hardware_reset=False,
+            source=source,
+            engram_index=idx,
         )
 
     def evaluate_execution_error(self, state: TheoExecutionState, actual_resulting_coords: torch.Tensor, error_threshold: float = 0.5) -> TheoExecutionState:
@@ -178,24 +207,75 @@ class TheoCore(nn.Module):
         return "plastic_hippocampal_core"
 
     @torch.no_grad()
-    def crystallize_from_plastic(self, sensor_pattern: torch.Tensor, action_pattern: torch.Tensor):
-        """Called by neocortex after plastic core reaches ≤0.007 MSE."""
-        self.scam.crystallize_skill(sensor_pattern, action_pattern)
-        # Recurrent weights are already frozen by nature of this core
+    def crystallize_from_plastic(self, sensor_pattern: torch.Tensor, action_pattern: torch.Tensor,
+                                 overwrite: bool = False) -> int:
+        """
+        Called once Neo's gate has passed for this (sensor, action) pair.
+        Writes a frozen engram and returns its slot. The executor stays plastic
+        so later skills can still be learned; call executor.freeze() to stop that.
+        """
+        return self.scam.crystallize_skill(sensor_pattern, action_pattern, overwrite=overwrite)
 
 
-# ====================== QUICK SELF-TEST ======================
+# ====================== SELF-TEST ======================
+def run_self_test() -> None:
+    torch.manual_seed(0)
+    D = 128
+    theo = TheoCore()
+    coords = torch.randn(1, 64) * 0.1
+
+    def onehot(i):
+        v = torch.zeros(1, D); v[0, i] = 1.0
+        return v
+
+    # 1. empty S-CAM: executor path, correct shapes
+    st = theo(onehot(42), coords)
+    assert st.source == "executor" and st.engram_index == -1
+    assert st.action_spikes.shape == (1, D) and st.predicted_coords.shape == (1, 64)
+    print("PASS 1: empty S-CAM falls through to the executor with correct shapes")
+
+    # 2. the executor is trainable (surrogate gradient reaches the first layer)
+    logits, _ = theo.executor_logits(onehot(42), coords)
+    F.binary_cross_entropy_with_logits(logits, onehot(7)).backward()
+    g = theo.executor.layers[0].weight.grad
+    assert g is not None and g.abs().sum() > 0, "no gradient reaches the executor"
+    theo.zero_grad()
+    print("PASS 2: gradient reaches the first executor layer")
+
+    # 3. crystallized engrams win and are emitted unmodified
+    for k in range(39):
+        theo.crystallize_from_plastic(onehot(k), onehot(k + 50))
+    for k in range(39):
+        st = theo(onehot(k), coords)
+        assert st.source == "scam" and st.confidence == 1.0 and not st.yield_to_plastic_core
+        assert torch.equal(st.action_spikes, onehot(k + 50)), f"engram {k} not emitted exactly"
+    print("PASS 3: 39/39 S-CAM hits emit the stored action exactly")
+
+    # 4. interference: train the executor hard on other data, engrams must not move
+    before = [theo(onehot(k), coords).action_spikes.clone() for k in range(39)]
+    w_before = theo.executor.layers[0].weight.clone()
+    h_before = theo.scam.content_hash()
+    opt = torch.optim.SGD(theo.parameters(), lr=0.5)
+    for step in range(30):
+        x = torch.zeros(8, D); x[torch.arange(8), torch.randint(60, D, (8,))] = 1.0
+        y = torch.zeros(8, D); y[torch.arange(8), torch.randint(0, D, (8,))] = 1.0
+        opt.zero_grad()
+        lg, _ = theo.executor_logits(x, torch.randn(8, 64))
+        F.binary_cross_entropy_with_logits(lg, y).backward()
+        opt.step()
+    assert not torch.equal(w_before, theo.executor.layers[0].weight), "executor did not actually train"
+    assert theo.scam.content_hash() == h_before, "S-CAM content changed during training"
+    for k in range(39):
+        assert torch.equal(theo(onehot(k), coords).action_spikes, before[k]), f"engram {k} drifted"
+    print("PASS 4: executor weights changed, all 39 engram readouts bit-identical")
+
+    # 5. freeze really freezes
+    theo.executor.freeze()
+    assert theo.executor.is_frozen
+    print("PASS 5: executor.freeze() leaves no trainable executor parameter")
+
+    print("\nAll TheoCore self-tests passed.")
+
+
 if __name__ == "__main__":
-    print("TheoCore self-test started...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    theo = TheoCore().to(device)
-
-    # Fake input: sensor spike (one-hot style) + current program coords
-    sensor = torch.zeros(1, 128, device=device)
-    sensor[0, 42] = 1.0  # example state
-    coords = torch.randn(1, 64, device=device) * 0.1
-
-    state = theo(sensor, coords)
-    print(f"Action shape: {state.action_spikes.shape} | Confidence: {state.confidence:.3f}")
-    print(f"Yield to plastic: {state.yield_to_plastic_core} | Mismatch: {state.mismatch_detected}")
-    print("TheoCore is ready for procedural execution. No lookup table used.")
+    run_self_test()

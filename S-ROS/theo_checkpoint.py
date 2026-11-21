@@ -24,7 +24,22 @@ from typing import List, Dict, Tuple, Optional
 
 from Theo_Core_t import TheoCore, TheoSCAM, TheoRecurrentExecutor
 
-SOUL_FORMAT_VERSION = "theo_soul_v1"
+SOUL_FORMAT_VERSION = "theo_soul_v2"  # v2: bool S-CAM buffers, engram checksum, full hyperparameter check
+
+
+def _current_hyperparameters(theo_core: "TheoCore") -> Dict:
+    """Every value that changes what the saved weights and engrams mean."""
+    return {
+        "spike_dim": theo_core.scam.spike_dim,
+        "max_engrams": theo_core.scam.max_engrams,
+        "match_threshold": theo_core.scam.match_threshold,
+        "coord_dim": theo_core.executor.coord_dim,
+        "hidden_dim": theo_core.executor.hidden_dim,
+        "num_layers": theo_core.executor.num_layers,
+        "beta": theo_core.executor.beta,
+        "num_steps": theo_core.executor.num_steps,
+        "confidence_threshold": theo_core.confidence_threshold,
+    }
 
 
 def save_theo_soul(
@@ -51,32 +66,14 @@ def save_theo_soul(
     Returns:
         The resolved absolute path of the saved file.
     """
-    # NOTE: TheoRecurrentExecutor does not store coord_dim as an instance
-    # attribute. It is recoverable as input_dim - spike_dim because
-    # TheoRecurrentExecutor.__init__ sets self.input_dim = spike_dim + coord_dim.
-    _coord_dim = theo_core.executor.input_dim - theo_core.scam.spike_dim
-
-    hyperparameters = {
-        "spike_dim": theo_core.scam.spike_dim,
-        "max_engrams": theo_core.scam.max_engrams,
-        "coord_dim": _coord_dim,
-        "hidden_dim": 256,
-        "num_layers": theo_core.executor.num_layers,
-        "beta": theo_core.executor.beta,
-        "num_steps": theo_core.executor.num_steps,
-        "confidence_threshold": theo_core.confidence_threshold,
-    }
+    hyperparameters = _current_hyperparameters(theo_core)
 
     checkpoint = {
         "format_version": SOUL_FORMAT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "crystallization_count": len(ledger),
         "theo_core_state_dict": theo_core.state_dict(),
-        "scam_buffers": {
-            "sensor_keys": theo_core.scam.sensor_keys.clone(),
-            "action_values": theo_core.scam.action_values.clone(),
-            "is_active": theo_core.scam.is_active.clone(),
-        },
+        "scam_content_hash": theo_core.scam.content_hash(),
         "crystallization_ledger": ledger,
         "hyperparameters": hyperparameters,
     }
@@ -122,7 +119,9 @@ def load_theo_soul(
     Raises:
         ValueError: If format version or any architecture dimension mismatches.
     """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    # weights_only=True: a .soul file holds only tensors and plain Python
+    # containers, so it never needs to execute pickled code.
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
 
     stored_version = checkpoint.get("format_version", "unknown")
     if stored_version != SOUL_FORMAT_VERSION:
@@ -132,24 +131,25 @@ def load_theo_soul(
         )
 
     stored_hp = checkpoint["hyperparameters"]
-    # NOTE: TheoRecurrentExecutor does not store coord_dim directly.
-    # Derived from input_dim - spike_dim, matching __init__ arithmetic.
-    _coord_dim = theo_core.executor.input_dim - theo_core.scam.spike_dim
-    current_hp = {
-        "spike_dim": theo_core.scam.spike_dim,
-        "max_engrams": theo_core.scam.max_engrams,
-        "coord_dim": _coord_dim,
-        "num_layers": theo_core.executor.num_layers,
-    }
+    current_hp = _current_hyperparameters(theo_core)
     for key, current_val in current_hp.items():
-        stored_val = stored_hp.get(key)
-        if stored_val is not None and stored_val != current_val:
+        if key not in stored_hp:
+            raise ValueError(f"Architecture mismatch on '{key}': missing from checkpoint.")
+        stored_val = stored_hp[key]
+        if stored_val != current_val:
             raise ValueError(
                 f"Architecture mismatch on '{key}': "
                 f"checkpoint has {stored_val}, current module has {current_val}."
             )
 
-    theo_core.load_state_dict(checkpoint["theo_core_state_dict"])
+    # Verify the engrams BEFORE touching the live module.
+    state = checkpoint["theo_core_state_dict"]
+    probe = TheoSCAM(stored_hp["spike_dim"], stored_hp["max_engrams"], stored_hp["match_threshold"])
+    probe.load_state_dict({k[len("scam."):]: v for k, v in state.items() if k.startswith("scam.")})
+    if probe.content_hash() != checkpoint.get("scam_content_hash"):
+        raise ValueError("S-CAM engram checksum mismatch: the checkpoint is corrupt or was modified.")
+
+    theo_core.load_state_dict(state)
 
     ledger = checkpoint.get("crystallization_ledger", [])
     return ledger, stored_hp
@@ -165,9 +165,12 @@ def test_theo_soul_roundtrip():
 
     original = TheoCore(spike_dim=128, coord_dim=64)
 
-    fake_sensor = torch.randn(1, 128)
-    fake_action = torch.randn(1, 128)
-    original.scam.crystallize_skill(fake_sensor, fake_action)
+    def onehot(i):
+        v = torch.zeros(1, 128); v[0, i] = 1.0
+        return v
+
+    for k in range(39):
+        original.crystallize_from_plastic(onehot(k), onehot(k + 50))
 
     ledger = [{
         "skill_id": "test_skill_001",
@@ -214,8 +217,22 @@ def test_theo_soul_roundtrip():
                 loaded.state_dict()[key]
             ), f"State dict key '{key}' mismatch"
 
+        # Behaviour, not just tensors: every engram and one executor-path
+        # state must act identically after load.
+        coords = torch.zeros(1, 64)
+        for k in range(39):
+            a = original(onehot(k), coords)
+            b = loaded(onehot(k), coords)
+            assert b.source == "scam" and torch.equal(a.action_spikes, b.action_spikes), \
+                f"engram {k} behaves differently after load"
+        a = original(onehot(100), coords)
+        b = loaded(onehot(100), coords)
+        assert a.source == b.source == "executor"
+        assert torch.equal(a.action_spikes, b.action_spikes), "executor path differs after load"
+        assert torch.equal(a.predicted_coords, b.predicted_coords), "forward model differs after load"
+
     print("PASS: test_theo_soul_roundtrip")
-    print(f"  Saved and loaded 1 crystallized skill")
+    print(f"  Saved and loaded 39 crystallized skills; behaviour identical after load")
     print(f"  All tensors match")
     print(f"  Ledger intact")
     print(f"  Hyperparameters verified")
@@ -262,7 +279,7 @@ def test_theo_soul_atomic_save():
         first_size = os.path.getsize(soul_path)
         assert first_size > 0
 
-        core.scam.crystallize_skill(torch.randn(1, 128), torch.randn(1, 128))
+        core.scam.crystallize_skill(torch.eye(128)[:1], torch.eye(128)[1:2])
         ledger = [{"skill_id": "atomic_test", "crystallized_at": "now",
                     "source_loss": 0.003, "engram_indices": [0],
                     "description": "atomic save test"}]
@@ -279,8 +296,50 @@ def test_theo_soul_atomic_save():
     print(f"  No temp files left behind")
 
 
+def test_theo_soul_hyperparameter_mismatch():
+    """A checkpoint must not load into a core whose dynamics differ, even if every tensor shape matches."""
+    for kwargs, key in ((dict(beta=0.1), "beta"), (dict(num_steps=5), "num_steps"),
+                        (dict(confidence_threshold=0.5), "confidence_threshold")):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            soul_path = os.path.join(tmpdir, "hp.soul")
+            save_theo_soul(TheoCore(), [], soul_path)
+            try:
+                load_theo_soul(soul_path, TheoCore(**kwargs))
+                assert False, f"Should have rejected mismatched {key}"
+            except ValueError as e:
+                assert key in str(e), f"Wrong error: {e}"
+    print("PASS: test_theo_soul_hyperparameter_mismatch")
+    print("  Rejected beta, num_steps and confidence_threshold mismatches")
+
+
+def test_theo_soul_tamper_detection():
+    """An engram edited on disk must be refused, and the live core left untouched."""
+    core = TheoCore()
+    key = torch.zeros(1, 128); key[0, 3] = 1.0
+    val = torch.zeros(1, 128); val[0, 9] = 1.0
+    core.crystallize_from_plastic(key, val)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        soul_path = os.path.join(tmpdir, "tamper.soul")
+        save_theo_soul(core, [], soul_path)
+        ckpt = torch.load(soul_path, weights_only=True)
+        ckpt["theo_core_state_dict"]["scam.action_values"][0, 9] = False
+        ckpt["theo_core_state_dict"]["scam.action_values"][0, 10] = True
+        torch.save(ckpt, soul_path)
+        fresh = TheoCore()
+        try:
+            load_theo_soul(soul_path, fresh)
+            assert False, "Should have rejected a tampered engram"
+        except ValueError as e:
+            assert "checksum" in str(e), f"Wrong error: {e}"
+        assert not fresh.scam.is_active.any(), "live core was modified by a rejected load"
+    print("PASS: test_theo_soul_tamper_detection")
+    print("  Tampered engram refused; live core untouched")
+
+
 if __name__ == "__main__":
     test_theo_soul_roundtrip()
     test_theo_soul_dimension_mismatch()
+    test_theo_soul_hyperparameter_mismatch()
+    test_theo_soul_tamper_detection()
     test_theo_soul_atomic_save()
     print("\nAll Theo checkpoint tests passed.")
