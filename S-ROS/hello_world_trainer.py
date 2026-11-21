@@ -87,6 +87,14 @@ class RoteLearner(nn.Module):
     Input: character-encoded BASIC line (padded to max_len)
     Output: character-encoded semantic description (padded to max_len)
 
+    KNOWN LIMIT: this architecture cannot generalize the rote rules, by
+    construction. The whole line is flattened into one Linear layer (one weight
+    per character slot, no weight sharing) and every output position is an
+    independent softmax, so it has no way to copy an unseen literal such as
+    'Cat' into the output. Neo will therefore, correctly, refuse to crystallize
+    these rules. It is kept as the minimal harness; a learner that can pass
+    needs a shared-weight sequence model with a copy path.
+
     Architecture: embedding -> LIF recurrent layers -> output projection
     The LIF dynamics give us the spiking substrate. The recurrence gives
     us the ability to process sequential input. The output projection
@@ -197,7 +205,10 @@ class HelloWorldTrainer:
         ).to(self.device)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
+        # PAD is a real target. With ignore_index=0 the model was never taught
+        # where the output ends, so its decoded string ran on into garbage and
+        # exact match against the expected output could never succeed.
+        self.criterion = nn.CrossEntropyLoss()
 
         self.cm = CrystallizationManager(
             loss_threshold=0.5,
